@@ -8,7 +8,7 @@
     "build": "turbo run build",
     "type-check": "turbo run type-check",
     "test": "turbo run test",
-    "test:e2e:unit": "node --experimental-strip-types --test apps/chrome-extension-e2e/tests/env.unit.test.ts",
+    "test:e2e:unit": "node --experimental-strip-types --test apps/chrome-extension-e2e/tests/*.unit.test.ts",
     "test:e2e:install": "pnpm exec playwright install --with-deps chromium",
     "test:e2e": "pnpm exec playwright test -c apps/chrome-extension-e2e/playwright.config.ts",
     "test:e2e:debug": "PWDEBUG=1 pnpm exec playwright test -c apps/chrome-extension-e2e/playwright.config.ts --headed --workers=1",

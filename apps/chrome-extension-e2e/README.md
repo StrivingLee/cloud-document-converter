@@ -9,6 +9,9 @@ Playwright.
 - Builds the extension before tests (`global-setup.ts`).
 - Copies build output into `.cache/extension`.
 - Runs live Feishu page + extension in Chromium and validates copy markdown.
+- Waits for the document model, pending blocks, and synced references before clicking Copy.
+- Clears the clipboard before copying and uses native clipboard methods so stale content or page overrides cannot mask a failure.
+- Tests loading and clipboard behavior against a synthetic page without a Feishu account.
 
 ## Commands
 
@@ -16,6 +19,7 @@ From repository root:
 
 ```bash
 pnpm run test:e2e:install
+pnpm run test:e2e:unit
 pnpm run test:e2e
 pnpm run test:e2e:debug
 ```
@@ -50,3 +54,4 @@ pnpm run test:e2e:debug --grep @live
 
 - The current spec focuses on live copy markdown validation against Feishu.
 - URL and expected markdown content are defined in `tests/live-copy-markdown.e2e.test.ts`.
+- Live copy cases have a four-minute total timeout, including separate waits of up to one minute for the button and document data, plus 20 seconds for the clipboard assertion.

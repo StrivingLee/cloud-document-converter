@@ -4,6 +4,7 @@ import path from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { chromium, expect, test } from '@playwright/test'
 import { resolveLiveCopyConfig } from '../src/env.js'
+import { copyMarkdownAndExpect } from '../src/copy-markdown.js'
 import {
   type Settings,
   SettingKey,
@@ -85,6 +86,8 @@ const createUserDataDir = async (): Promise<{
 
 for (const liveCase of liveCopyCases) {
   test(`@live copy markdown equals expected text [${liveCase.name}]`, async () => {
+    // Allow navigation, block loading, clipboard polling and browser cleanup.
+    test.setTimeout(4 * 60 * 1000)
     const userDataDir = await createUserDataDir()
     const context = await chromium.launchPersistentContext(userDataDir.path, {
       channel: 'chromium',
@@ -119,48 +122,7 @@ for (const liveCase of liveCopyCases) {
       })
       await page.bringToFront()
 
-      const copyButton = page.locator('[data-CDC-button-type="copy"]')
-      await expect(copyButton).toBeVisible({
-        timeout: 2 * 60 * 1000,
-      })
-
-      await copyButton.click()
-
-      let clipboardResult = ''
-
-      try {
-        const poll = expect.poll(
-          async () => {
-            await page.bringToFront()
-            const clipboardText = await page.evaluate(async () => {
-              return await navigator.clipboard.readText()
-            })
-
-            clipboardResult = clipboardText.trim()
-
-            return clipboardResult
-          },
-          {
-            timeout: 20 * 1000,
-            intervals: [500, 1000, 2000],
-          },
-        )
-
-        if (liveCase.match === 'equals') {
-          await poll.toBe(liveCase.expectedText)
-        } else {
-          await poll.toContain(liveCase.expectedText)
-        }
-      } catch {
-        throw new Error(
-          [
-            'copy markdown 验证失败',
-            `验证方式: ${liveCase.match}`,
-            `验证内容: ${JSON.stringify(liveCase.expectedText)}`,
-            `输出结果: ${JSON.stringify(clipboardResult)}`,
-          ].join('\n'),
-        )
-      }
+      await copyMarkdownAndExpect(page, liveCase)
     } finally {
       await context.close()
       if (userDataDir.shouldCleanup) {
