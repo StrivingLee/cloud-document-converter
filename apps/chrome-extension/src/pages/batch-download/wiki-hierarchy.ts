@@ -101,7 +101,7 @@ export function pageKey(url: string): string {
 // 1. Walk
 // ---------------------------------------------------------------------------
 
-export type FetchJson = (url: string) => Promise<unknown>
+export type FetchJson = (url: string, signal?: AbortSignal) => Promise<unknown>
 
 export interface WalkOptions {
   fetchJson: FetchJson
@@ -125,6 +125,36 @@ export class WikiApiError extends Error {
   }
 }
 
+export function throwIfWikiCancelled(signal?: AbortSignal): void {
+  if (signal?.aborted) throw new WikiApiError('Walk cancelled')
+}
+
+/** Ignore late responses from operations that cannot receive an AbortSignal. */
+export function withWikiCancellation<T>(
+  operation: Promise<T>,
+  signal?: AbortSignal,
+): Promise<T> {
+  if (!signal) return operation
+  return new Promise<T>((resolve, reject) => {
+    const cancel = () => {
+      signal.removeEventListener('abort', cancel)
+      reject(new WikiApiError('Walk cancelled'))
+    }
+    signal.addEventListener('abort', cancel, { once: true })
+    operation.then(
+      value => {
+        signal.removeEventListener('abort', cancel)
+        resolve(value)
+      },
+      (error: unknown) => {
+        signal.removeEventListener('abort', cancel)
+        reject(error instanceof Error ? error : new Error(String(error)))
+      },
+    )
+    if (signal.aborted) cancel()
+  })
+}
+
 const defaultSleep = (ms: number) =>
   new Promise<void>(resolve => setTimeout(resolve, ms))
 
@@ -143,19 +173,26 @@ async function callApi(
   const backoff = opts.backoffMs ?? 1500
   let last: WikiApiError = new WikiApiError(`No response from ${url}`)
   for (let a = 0; a < attempts; a++) {
-    if (opts.signal?.aborted) throw new WikiApiError('Walk cancelled')
-    await sleep(opts.throttleMs ?? 200)
+    throwIfWikiCancelled(opts.signal)
+    await withWikiCancellation(sleep(opts.throttleMs ?? 200), opts.signal)
+    throwIfWikiCancelled(opts.signal)
     try {
-      const body = (await opts.fetchJson(url)) as ApiEnvelope | null
+      const body = (await withWikiCancellation(
+        opts.fetchJson(url, opts.signal),
+        opts.signal,
+      )) as ApiEnvelope | null
+      throwIfWikiCancelled(opts.signal)
       if (body && body.code === 0 && body.data) return body.data
       last = new WikiApiError(
         `Feishu API answered code ${String(body?.code ?? 'none')}${body?.msg ? ` (${body.msg})` : ''}`,
         body?.code,
       )
     } catch (e) {
+      throwIfWikiCancelled(opts.signal)
       last = new WikiApiError(e instanceof Error ? e.message : String(e))
     }
-    if (a + 1 < attempts) await sleep(backoff * (a + 1))
+    if (a + 1 < attempts)
+      await withWikiCancellation(sleep(backoff * (a + 1)), opts.signal)
   }
   throw last
 }
@@ -219,6 +256,7 @@ export async function walkWiki(
       (a, b) => (a.sort_id ?? 0) - (b.sort_id ?? 0),
     )
     for (const k of kids) {
+      throwIfWikiCancelled(opts.signal)
       nodes.push({
         token: k.wiki_token,
         title: (k.title ?? '').trim(),
@@ -231,6 +269,7 @@ export async function walkWiki(
   }
   if (info.hasChild) await walk(rootToken, 1)
 
+  throwIfWikiCancelled(opts.signal)
   return {
     origin,
     rootToken,
@@ -377,7 +416,9 @@ export function buildTree(
     tree: root,
     dropped,
     unusedRenames: [...renames.keys()],
-    problems: validateTree(root, numbering ? width : null),
+    problems: validateTree(root, numbering ? width : null, {
+      allowNumberingGaps: only.length > 0,
+    }),
     fileCount: all.filter(n => n.type === 'file').length,
     folderCount: all.filter(n => n.type === 'folder').length - 1,
   }
@@ -388,10 +429,11 @@ export function* iterNodes(n: HierarchyNode): Generator<HierarchyNode> {
   if (n.type === 'folder') for (const c of n.children) yield* iterNodes(c)
 }
 
-/** Duplicate ids, empty folders, and (when numbered) gaps or disorder in NNN. */
+/** Duplicate ids, empty folders, and invalid numbering; subsets may have gaps. */
 export function validateTree(
   root: HierarchyFolder,
   width: number | null,
+  options: { allowNumberingGaps?: boolean } = {},
 ): string[] {
   const problems: string[] = []
   const ids = new Set<string>()
@@ -408,10 +450,19 @@ export function validateTree(
       else problems.push(`bad name ${n.name}`)
     }
   }
-  const contiguous = nums.every(
-    (v, i) => i === 0 || v === (nums[i - 1] ?? NaN) + 1,
+  const ordered = nums.every(
+    (v, i) =>
+      i === 0 ||
+      (options.allowNumberingGaps
+        ? v > (nums[i - 1] ?? NaN)
+        : v === (nums[i - 1] ?? NaN) + 1),
   )
-  if (!contiguous) problems.push('numbers are not contiguous in tree order')
+  if (!ordered)
+    problems.push(
+      options.allowNumberingGaps
+        ? 'numbers are not strictly increasing in tree order'
+        : 'numbers are not contiguous in tree order',
+    )
   return problems
 }
 

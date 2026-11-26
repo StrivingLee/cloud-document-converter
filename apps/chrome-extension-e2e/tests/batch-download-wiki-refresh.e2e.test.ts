@@ -174,6 +174,36 @@ async function launch(cookiesOnlyInTab = false): Promise<Harness> {
 const urlInput = (page: Page) =>
   page.getByPlaceholder('https://xxx.feishu.cn/wiki/...')
 
+/** Hold the last child-list response so cancellation happens during a request. */
+async function holdLastRequest(context: BrowserContext) {
+  let announce!: () => void
+  let release!: () => void
+  let finish!: () => void
+  const requested = new Promise<void>(resolve => (announce = resolve))
+  const gate = new Promise<void>(resolve => (release = resolve))
+  const completed = new Promise<void>(resolve => (finish = resolve))
+  await context.route(
+    '**/space/api/wiki/v2/tree/get_node_child/**',
+    async route => {
+      const token = new URL(route.request().url()).searchParams.get(
+        'wiki_token',
+      )
+      if (token !== 'A') {
+        await route.fallback()
+        return
+      }
+      announce()
+      await gate
+      try {
+        await route.fallback()
+      } finally {
+        finish()
+      }
+    },
+  )
+  return { requested, release, completed }
+}
+
 test('refresh now previews the wiki, applies it, and remembers the wiki', async () => {
   const h = await launch()
   try {
@@ -305,6 +335,147 @@ test('falls back to fetching inside a Feishu tab when cookies are not sent', asy
     await page.getByTestId('refresh-apply').click()
     await expect(page.getByText('000 - Handbook')).toBeVisible()
   } finally {
+    await h.cleanup()
+  }
+})
+
+test('applies non-adjacent sections with their original numbers', async () => {
+  const h = await launch()
+  try {
+    const { page, wiki } = h
+    wiki['ROOT'] = { title: 'Handbook', children: ['A', 'B', 'C'] }
+    wiki['C'] = { title: '3. Serving' }
+    await urlInput(page).fill(ROOT_URL)
+    await page.getByText('Advanced options', { exact: true }).click()
+    await page.getByPlaceholder('1.\n2.').fill('1.\n3.')
+    await page.getByTestId('refresh-now').click()
+    await expect(page.getByTestId('refresh-preview')).toContainText(
+      '0 → 4 pages: 4 added',
+    )
+    await expect(page.getByTestId('refresh-apply')).toBeEnabled()
+    await page.getByTestId('refresh-apply').click()
+    await expect(
+      page.getByText('001 - 1. Basics', { exact: true }),
+    ).toBeVisible()
+    await expect(
+      page.getByText('005 - 3. Serving', { exact: true }),
+    ).toBeVisible()
+    await expect(
+      page.getByText('004 - 2. Training', { exact: true }),
+    ).toHaveCount(0)
+    await expect(page.getByText('000 - Handbook', { exact: true })).toHaveCount(
+      0,
+    )
+  } finally {
+    await h.cleanup()
+  }
+})
+
+test('invalidates a manual preview before exporting the current tree', async () => {
+  const h = await launch()
+  try {
+    const { page, wiki } = h
+    await urlInput(page).fill(ROOT_URL)
+    await page.getByTestId('refresh-now').click()
+    await page.getByTestId('refresh-apply').click()
+    wiki['B'] = { title: '2. Changed' }
+    await page.getByTestId('refresh-now').click()
+    await expect(page.getByTestId('refresh-preview')).toContainText('1 renamed')
+
+    // Automatic refresh is off: exporting must invalidate the old snapshot.
+    await page.getByRole('button', { name: 'Export ZIP' }).click()
+    await expect(
+      page.getByRole('button', { name: 'Pause', exact: true }),
+    ).toBeVisible()
+    await expect(page.getByTestId('refresh-preview')).toBeHidden()
+    await expect(page.getByTestId('refresh-apply')).toHaveCount(0)
+    await expect(
+      page.getByText('004 - 2. Training', { exact: true }),
+    ).toBeVisible()
+    await expect(
+      page.getByText('004 - 2. Changed', { exact: true }),
+    ).toHaveCount(0)
+    await page.getByRole('button', { name: 'Pause', exact: true }).click()
+    await expect(page.getByTestId('refresh-now')).toBeDisabled()
+    await expect(page.getByTestId('refresh-preview')).toBeHidden()
+  } finally {
+    await h.cleanup()
+  }
+})
+
+for (const cookiesOnlyInTab of [false, true]) {
+  test(`cancels automatic refresh during the last ${cookiesOnlyInTab ? 'tab' : 'direct'} request without exporting`, async () => {
+    const h = await launch(cookiesOnlyInTab)
+    let held: Awaited<ReturnType<typeof holdLastRequest>> | undefined
+    try {
+      const { page } = h
+      await urlInput(page).fill(ROOT_URL)
+      await page.getByTestId('refresh-now').click()
+      await page.getByTestId('refresh-apply').click()
+      await page.getByTestId('refresh-before-run').check()
+      held = await holdLastRequest(h.context)
+
+      const exportButton = page.getByRole('button', { name: 'Export ZIP' })
+      await exportButton.click()
+      await held.requested
+      await page.getByRole('button', { name: 'Cancel', exact: true }).click()
+      // Cancellation must complete while the response is still withheld.
+      await expect(exportButton).toBeEnabled()
+      await expect(
+        page.getByText(
+          'Wiki refresh cancelled; the current tree is unchanged.',
+          { exact: true },
+        ),
+      ).toBeVisible()
+      await expect(
+        page.getByRole('button', { name: 'Pause', exact: true }),
+      ).toHaveCount(0)
+      await expect(page.getByTestId('refresh-preview')).toBeHidden()
+
+      held.release()
+      await held.completed
+      await expect(
+        page.getByRole('button', { name: 'Pause', exact: true }),
+      ).toHaveCount(0)
+      await expect(page.getByTestId('refresh-preview')).toBeHidden()
+      await expect(
+        page.getByText('000 - Handbook', { exact: true }),
+      ).toBeVisible()
+      await expect(
+        page.getByText('The wiki matches the current tree.', { exact: true }),
+      ).toHaveCount(0)
+    } finally {
+      held?.release()
+      await h.cleanup()
+    }
+  })
+}
+
+test('does not start export while a manual refresh is still reading the wiki', async () => {
+  const h = await launch()
+  let held: Awaited<ReturnType<typeof holdLastRequest>> | undefined
+  try {
+    const { page } = h
+    await urlInput(page).fill(ROOT_URL)
+    await page.getByTestId('refresh-now').click()
+    await page.getByTestId('refresh-apply').click()
+    held = await holdLastRequest(h.context)
+    await page.getByTestId('refresh-now').click()
+    await held.requested
+    await page.getByRole('button', { name: 'Export ZIP' }).click()
+    await expect(
+      page.getByRole('button', { name: 'Pause', exact: true }),
+    ).toHaveCount(0)
+    await page.getByRole('button', { name: 'Cancel', exact: true }).click()
+    await expect(page.getByTestId('refresh-now')).toBeEnabled()
+    held.release()
+    await held.completed
+    await expect(page.getByTestId('refresh-preview')).toBeHidden()
+    await expect(
+      page.getByRole('button', { name: 'Pause', exact: true }),
+    ).toHaveCount(0)
+  } finally {
+    held?.release()
     await h.cleanup()
   }
 })

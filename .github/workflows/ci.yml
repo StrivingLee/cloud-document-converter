@@ -30,7 +30,8 @@ jobs:
         run: pnpm run test
 
   e2e-test:
-    runs-on: ubuntu-latest
+    # Pin to a Playwright-supported OS; ubuntu-latest may advance ahead of support.
+    runs-on: ubuntu-24.04
     steps:
       - name: Checkout
         uses: actions/checkout@v4

@@ -1,4 +1,4 @@
-import { describe, expect, it } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import {
   buildTree,
   carryOverStatuses,
@@ -7,6 +7,7 @@ import {
   iterNodes,
   parsePairs,
   parseWikiUrl,
+  validateTree,
   walkWiki,
   type FetchJson,
   type HierarchyFile,
@@ -155,6 +156,81 @@ describe('walkWiki', () => {
       }),
     ).rejects.toThrow('cancelled')
   })
+
+  it('does not fetch when cancelled during throttling', async () => {
+    const ctrl = new AbortController()
+    const fetchJson = vi.fn(fakeApi().fetchJson)
+    await expect(
+      walkWiki(`${ORIGIN}/wiki/ROOT`, {
+        fetchJson,
+        signal: ctrl.signal,
+        sleep: () => {
+          ctrl.abort()
+          return Promise.resolve()
+        },
+      }),
+    ).rejects.toThrow('cancelled')
+    expect(fetchJson).not.toHaveBeenCalled()
+  })
+
+  it.each(['C', 'A2'])(
+    'rejects cancellation during the final response for %s',
+    async token => {
+      const ctrl = new AbortController()
+      const api = fakeApi()
+      const fetchJson = vi.fn(async (url: string, signal?: AbortSignal) => {
+        expect(signal).toBe(ctrl.signal)
+        const response = await api.fetchJson(url)
+        if (token === 'C' || url.includes('/get_node_child/')) ctrl.abort()
+        return response
+      })
+      await expect(
+        walkWiki(`${ORIGIN}/wiki/${token}`, {
+          fetchJson,
+          sleep: noSleep,
+          signal: ctrl.signal,
+        }),
+      ).rejects.toThrow('cancelled')
+      expect(fetchJson).toHaveBeenCalledTimes(token === 'C' ? 1 : 2)
+    },
+  )
+
+  it('cancels a pending request without waiting for its late response', async () => {
+    const ctrl = new AbortController()
+    let respond!: (value: unknown) => void
+    const fetchJson = vi.fn(
+      () => new Promise<unknown>(resolve => (respond = resolve)),
+    )
+    const pending = walkWiki(`${ORIGIN}/wiki/C`, {
+      fetchJson,
+      sleep: noSleep,
+      signal: ctrl.signal,
+    })
+    const rejected = expect(pending).rejects.toThrow('cancelled')
+    await vi.waitFor(() => {
+      expect(fetchJson).toHaveBeenCalledTimes(1)
+    })
+    ctrl.abort()
+    await rejected
+    respond(await fakeApi().fetchJson(`${ORIGIN}/get_info/?wiki_token=C`))
+    expect(fetchJson).toHaveBeenCalledTimes(1)
+  })
+
+  it('does not retry when cancelled during backoff', async () => {
+    const ctrl = new AbortController()
+    const fetchJson = vi.fn(() => Promise.resolve({ code: 1 }))
+    await expect(
+      walkWiki(`${ORIGIN}/wiki/ROOT`, {
+        fetchJson,
+        signal: ctrl.signal,
+        sleep: ms => {
+          if (ms === 1500) ctrl.abort()
+          return Promise.resolve()
+        },
+      }),
+    ).rejects.toThrow('cancelled')
+    expect(fetchJson).toHaveBeenCalledTimes(1)
+  })
 })
 
 describe('buildTree', () => {
@@ -238,8 +314,51 @@ describe('buildTree', () => {
     expect(r.problems).toEqual([])
     expect(r.tree.children[1].name).toBe('0001 - Page 0')
   })
+
+  it('keeps original numbering across non-adjacent sections', async () => {
+    const walk = await walkFake()
+    const full = buildTree(walk)
+    const subset = buildTree(walk, { only: ['1.', '3.'] })
+    const files = [...iterNodes(subset.tree)].filter(
+      (n): n is HierarchyFile => n.type === 'file',
+    )
+    expect(subset.problems).toEqual([])
+    expect(files.map(n => n.name)).toEqual([
+      '001 - 1. Basics',
+      '002 - 1.1 Tokens',
+      '003 - 1.2 Attention / Heads',
+      '004 - Notes: Q&A?',
+      '007 - 3. Serving',
+    ])
+    const fullNames = new Map(
+      [...iterNodes(full.tree)].map(n => [n.id, n.name]),
+    )
+    expect(files.every(n => n.name === fullNames.get(n.id))).toBe(true)
+    expect(subset.fileCount).toBe(5)
+    expect(subset.folderCount).toBe(2)
+  })
 })
 
+describe('validateTree', () => {
+  it('still rejects numbering gaps in an unfiltered tree', async () => {
+    const tree = buildTree(await walkFake()).tree
+    tree.children.splice(1, 2)
+    expect(validateTree(tree, 3)).toContain(
+      'numbers are not contiguous in tree order',
+    )
+  })
+
+  it.each(['000 - repeated', '006 - out of order'])(
+    'rejects %s even when gaps are allowed',
+    async name => {
+      const tree = buildTree(await walkFake()).tree
+      tree.children[1].name = name
+      expect(validateTree(tree, 3, { allowNumberingGaps: true })).toContain(
+        'numbers are not strictly increasing in tree order',
+      )
+    },
+  )
+})
 describe('diffTrees', () => {
   it('reports nothing for identical trees, even when renumbered', async () => {
     const a = buildTree(await walkFake()).tree

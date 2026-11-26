@@ -678,6 +678,7 @@ const wikiRefreshCard = ref<InstanceType<typeof WikiRefreshCard> | null>(null)
 const preparingRun = ref(false)
 
 const applyRefreshedTree = (tree: FolderNode) => {
+  if (exporting.value) return
   rootNode.value = tree
   selectedNodeId.value = 'root'
 }

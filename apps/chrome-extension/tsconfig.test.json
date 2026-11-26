@@ -5,5 +5,5 @@
     "erasableSyntaxOnly": false
   },
   "extends": "@dolphin/typescript-config/node.json",
-  "include": ["tests"]
+  "include": ["tests", "src/chrome-types.d.ts"]
 }

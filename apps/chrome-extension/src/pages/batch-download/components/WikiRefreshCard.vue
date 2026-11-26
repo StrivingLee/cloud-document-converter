@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref, watch } from 'vue'
+import { computed, onMounted, onUnmounted, ref, watch } from 'vue'
 import { useI18n } from 'vue-i18n'
 import { RefreshCw, X, ExternalLink } from 'lucide-vue-next'
 import { cn } from '@/lib/utils'
@@ -13,6 +13,7 @@ import {
   parseLines,
   parsePairs,
   parseWikiUrl,
+  throwIfWikiCancelled,
   validateTree,
   walkWiki,
   type BuildResult,
@@ -130,6 +131,21 @@ let abort: AbortController | null = null
 let pendingRun: ((proceed: boolean) => void) | null = null
 const waitingForRun = ref(false)
 
+watch(
+  () => props.busy,
+  busy => {
+    if (!busy) return
+    abort?.abort()
+    preview.value = null
+    finishRun(false)
+  },
+)
+
+onUnmounted(() => {
+  abort?.abort()
+  finishRun(false)
+})
+
 const unchanged = computed(() =>
   preview.value ? isEmptyDiff(preview.value.diff) : false,
 )
@@ -137,7 +153,7 @@ const unchanged = computed(() =>
 const log = (m: string, type: LogType = 'info') => emit('log', m, type)
 
 async function computePreview(): Promise<Preview | null> {
-  const s = settings.value
+  const s = { ...settings.value }
   const parsed = parseWikiUrl(s.rootUrl)
   if (!parsed) {
     log(t('batch_download.refresh.invalid_url'), 'error')
@@ -150,13 +166,15 @@ async function computePreview(): Promise<Preview | null> {
 
   walking.value = true
   pagesFound.value = 0
-  abort = new AbortController()
+  const controller = new AbortController()
+  abort = controller
   const fetcher = createWikiFetcher(parsed.origin, s.rootUrl.trim())
+  let result: Preview | null = null
   log(t('batch_download.refresh.walking_log', { url: s.rootUrl.trim() }))
   try {
     const opts = {
       fetchJson: fetcher.fetchJson,
-      signal: abort.signal,
+      signal: controller.signal,
       onProgress: (n: number) => (pagesFound.value = n),
     }
     const walk = await walkWiki(s.rootUrl, opts)
@@ -166,6 +184,7 @@ async function computePreview(): Promise<Preview | null> {
       try {
         lead.title = (await getWikiInfo(walk.origin, lead.token, opts, 1)).title
       } catch {
+        throwIfWikiCancelled(controller.signal)
         lead.title = lead.token
         log(
           t('batch_download.refresh.lead_no_title', { token: lead.token }),
@@ -173,6 +192,7 @@ async function computePreview(): Promise<Preview | null> {
         )
       }
     }
+    throwIfWikiCancelled(controller.signal)
     log(
       t('batch_download.refresh.walked', {
         count: walk.nodes.length + 1,
@@ -204,9 +224,10 @@ async function computePreview(): Promise<Preview | null> {
     for (const p of build.problems) log(p, 'error')
     if (build.fileCount === 0)
       build.problems.push(t('batch_download.refresh.empty'))
-    return { build, merged, kept, diff: diffTrees(props.tree, build.tree) }
+    throwIfWikiCancelled(controller.signal)
+    result = { build, merged, kept, diff: diffTrees(props.tree, build.tree) }
   } catch (err) {
-    if (!abort?.signal.aborted)
+    if (!controller.signal.aborted)
       log(
         t('batch_download.refresh.failed', {
           error: err instanceof Error ? err.message : String(err),
@@ -214,17 +235,20 @@ async function computePreview(): Promise<Preview | null> {
         'error',
       )
     else log(t('batch_download.refresh.cancelled'), 'warn')
-    return null
   } finally {
+    await fetcher.dispose()
     walking.value = false
     abort = null
-    await fetcher.dispose()
   }
+  if (controller.signal.aborted && result)
+    log(t('batch_download.refresh.cancelled'), 'warn')
+  return controller.signal.aborted || props.busy ? null : result
 }
 
 /** "Refresh now": always show the preview, even when nothing changed. */
 async function refreshNow() {
   if (props.busy || walking.value || waitingForRun.value) return
+  preview.value = null
   preview.value = await computePreview()
 }
 
@@ -234,7 +258,7 @@ function cancelWalk() {
 
 function apply() {
   const p = preview.value
-  if (!p || p.build.problems.length) return
+  if (props.busy || walking.value || !p || p.build.problems.length) return
   emit('apply', p.merged)
   log(
     t('batch_download.refresh.applied', {
@@ -267,13 +291,15 @@ function finishRun(proceed: boolean) {
  * with old tree) / Cancel.
  */
 async function prepareRun(): Promise<boolean> {
+  if (props.busy || walking.value || waitingForRun.value) return false
+  preview.value = null
   if (!settings.value.beforeEachRun) return true
   if (!rootToken.value) {
     log(t('batch_download.refresh.invalid_url'), 'error')
     return false
   }
   const p = await computePreview()
-  if (!p) return false // the walk failed; never export a stale tree silently
+  if (!p || props.busy) return false // never export after a failed or cancelled walk
   if (isEmptyDiff(p.diff) && !p.build.problems.length) {
     emit('apply', p.merged) // same pages; pick up statuses/ids consistently
     log(t('batch_download.refresh.no_changes'), 'success')
@@ -285,6 +311,7 @@ async function prepareRun(): Promise<boolean> {
 }
 
 function keepCurrentAndRun() {
+  if (props.busy || walking.value) return
   preview.value = null
   log(t('batch_download.refresh.kept_current'), 'warn')
   finishRun(true)
@@ -547,7 +574,7 @@ const sections = computed(() => {
         </button>
         <button
           class="bg-blue-600 hover:bg-blue-700 text-white px-4 py-2 rounded-md font-medium text-xs cursor-pointer disabled:opacity-50 disabled:cursor-not-allowed shadow-sm"
-          :disabled="preview.build.problems.length > 0"
+          :disabled="busy || walking || preview.build.problems.length > 0"
           data-testid="refresh-apply"
           @click="apply"
         >
